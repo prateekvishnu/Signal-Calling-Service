@@ -17,7 +17,6 @@ RUN cd fuzz && ${HOME}/.cargo/bin/cargo +nightly fuzz build
 # Package Stage
 FROM ubuntu:20.04
 
-COPY --from=builder SCS/fuzz/target/x86_64-unknown-linux-gnu/release/dtls /
 COPY --from=builder SCS/fuzz/target/x86_64-unknown-linux-gnu/release/ice /
 COPY --from=builder SCS/fuzz/target/x86_64-unknown-linux-gnu/release/rtcp /
 COPY --from=builder SCS/fuzz/target/x86_64-unknown-linux-gnu/release/rtp /
