@@ -15,6 +15,7 @@ use std::{
 
 use aes::{cipher::generic_array::GenericArray, Aes128, BlockEncrypt, NewBlockCipher};
 use aes_gcm::{AeadInPlace, Aes128Gcm, NewAead};
+use byteorder::{ReadBytesExt, BE};
 use log::*;
 use zeroize::Zeroizing;
 
@@ -22,8 +23,7 @@ use crate::{
     audio,
     common::{
         expand_truncated_counter, parse_u16, parse_u32, read_u16, round_up_to_multiple_of, Bits,
-        BytesReader, CheckedSplitAt, DataSize, Duration, Instant, KeySortedCache, ReadResult,
-        TwoGenerationCache, Writer,
+        CheckedSplitAt, DataSize, Duration, Instant, KeySortedCache, TwoGenerationCache, Writer,
     },
     transportcc as tcc,
 };
@@ -65,8 +65,6 @@ const RTX_SSRC_OFFSET: Ssrc = 1;
 
 pub type Key = Zeroizing<[u8; SRTP_KEY_LEN]>;
 pub type Salt = [u8; SRTP_SALT_LEN];
-// Not needed when using DTLS-SRTP
-// pub type KeyPlusSalt = [u8; SRTP_KEY_LEN + SRTP_SALT_LEN];
 pub type Iv = [u8; SRTP_IV_LEN];
 // In the order [client_key, client_salt, server_key, server_salt]
 pub const MASTER_KEY_MATERIAL_LEN: usize =
@@ -86,35 +84,6 @@ pub struct KeysAndSalts {
 }
 
 impl KeysAndSalts {
-    // Returns (client, server)
-    pub fn derive_from_dtls_srtp_master(dtls_srtp_master: &[u8]) -> (KeysAndSalts, KeysAndSalts) {
-        assert!(
-            dtls_srtp_master.len() >= SRTP_KEY_LEN + SRTP_KEY_LEN + SRTP_SALT_LEN + SRTP_SALT_LEN
-        );
-        let client_key: Key = Zeroizing::new(dtls_srtp_master[..SRTP_KEY_LEN].try_into().unwrap());
-        let server_key: Key = Zeroizing::new(
-            dtls_srtp_master[SRTP_KEY_LEN..][..SRTP_KEY_LEN]
-                .try_into()
-                .unwrap(),
-        );
-        let client_salt: Salt = dtls_srtp_master[SRTP_KEY_LEN..][SRTP_KEY_LEN..][..SRTP_SALT_LEN]
-            .try_into()
-            .unwrap();
-        let server_salt: Salt = dtls_srtp_master[SRTP_KEY_LEN..][SRTP_KEY_LEN..][SRTP_SALT_LEN..]
-            [..SRTP_SALT_LEN]
-            .try_into()
-            .unwrap();
-        let client = Self::derive_from_master(&KeyAndSalt {
-            key: client_key,
-            salt: client_salt,
-        });
-        let server = Self::derive_from_master(&KeyAndSalt {
-            key: server_key,
-            salt: server_salt,
-        });
-        (client, server)
-    }
-
     // Returns (client, server)
     pub fn derive_client_and_server_from_master_key_material(
         master_key_material: &MasterKeyMaterial,
@@ -1074,22 +1043,23 @@ fn rtcp_iv(sender_ssrc: Ssrc, index: u32, salt: &Salt) -> Option<Iv> {
     ])
 }
 
-fn parse_nack(rtcp_payload: &[u8]) -> ReadResult<Nack> {
-    let mut reader = BytesReader::from_slice(rtcp_payload);
-    let ssrc = reader.read_u32_be()?;
-    let seqnums = reader.read_until_end_exactly(|reader| {
-        let first_seqnum = reader.read_u16_be()?;
-        let mask = reader.read_u16_be()?;
-        let seqnums = std::iter::once(first_seqnum).chain((0..16u16).filter_map(move |index| {
-            if mask.ls_bit(index as u8) {
-                Some(first_seqnum.wrapping_add(index + 1))
-            } else {
-                None
-            }
-        }));
-        Ok(seqnums)
-    })?;
-    let seqnums = seqnums.into_iter().flatten().collect();
+fn parse_nack(rtcp_payload: &[u8]) -> std::io::Result<Nack> {
+    let mut reader = rtcp_payload;
+    let ssrc = reader.read_u32::<BE>()?;
+    let mut seqnums = Vec::new();
+    while !reader.is_empty() {
+        let first_seqnum = reader.read_u16::<BE>()?;
+        let mask = reader.read_u16::<BE>()?;
+        let entry_seqnums =
+            std::iter::once(first_seqnum).chain((0..16u16).filter_map(move |index| {
+                if mask.ls_bit(index as u8) {
+                    Some(first_seqnum.wrapping_add(index + 1))
+                } else {
+                    None
+                }
+            }));
+        seqnums.extend(entry_seqnums);
+    }
     Ok(Nack { ssrc, seqnums })
 }
 
@@ -1980,13 +1950,13 @@ mod test {
         let seqnums = vec![];
         let payload = vec![1u8, 2, 3, 4];
         assert_eq!(payload, write_nack(ssrc, expand_seqnums(&seqnums)).to_vec());
-        assert_eq!(Ok(Nack { ssrc, seqnums }), parse_nack(&payload));
+        assert_eq!(Nack { ssrc, seqnums }, parse_nack(&payload).unwrap());
 
         // Example from WebRTC modules/rtp_rtcp/source/rtcp_packet/nack_unittest.cc.
         let seqnums = vec![0, 1, 3, 8, 16];
         let payload = vec![0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x80, 0x85];
         assert_eq!(payload, write_nack(ssrc, expand_seqnums(&seqnums)).to_vec());
-        assert_eq!(Ok(Nack { ssrc, seqnums }), parse_nack(&payload));
+        assert_eq!(Nack { ssrc, seqnums }, parse_nack(&payload).unwrap());
 
         let seqnums = vec![
             // First item
@@ -2002,7 +1972,7 @@ mod test {
             0b11110000, 0b00011101, // Second bitmask
         ];
         assert_eq!(payload, write_nack(ssrc, expand_seqnums(&seqnums)).to_vec());
-        assert_eq!(Ok(Nack { ssrc, seqnums }), parse_nack(&payload));
+        assert_eq!(Nack { ssrc, seqnums }, parse_nack(&payload).unwrap());
 
         // Make sure rollover works
         let seqnums = vec![0xFFFF, 0, 1];
@@ -2016,7 +1986,7 @@ mod test {
             0b000000000,
             0b000000011,
         ];
-        assert_eq!(Ok(Nack { ssrc, seqnums }), parse_nack(&payload));
+        assert_eq!(Nack { ssrc, seqnums }, parse_nack(&payload).unwrap());
     }
 
     #[test]
@@ -2218,9 +2188,11 @@ mod test {
 
     #[test]
     fn test_endpoint_nack_rtx() {
-        let dtls_srtp_master = vec![0u8; 100];
+        let srtp_master_key_material = zeroize::Zeroizing::new([0u8; 56]);
         let (sender_key, receiver_key) =
-            KeysAndSalts::derive_from_dtls_srtp_master(&dtls_srtp_master);
+            KeysAndSalts::derive_client_and_server_from_master_key_material(
+                &srtp_master_key_material,
+            );
         let now = Instant::now();
         let at = |millis| now + Duration::from_millis(millis);
         let mut sender = Endpoint::new(receiver_key.clone(), sender_key.clone(), now, 1, 2);
@@ -2414,9 +2386,11 @@ mod test {
 
     #[test]
     fn test_drop_incoming_rtp_when_seqnum_reused() {
-        let dtls_srtp_master = vec![0u8; 100];
+        let srtp_master_key_material = zeroize::Zeroizing::new([0u8; 56]);
         let (sender_key, receiver_key) =
-            KeysAndSalts::derive_from_dtls_srtp_master(&dtls_srtp_master);
+            KeysAndSalts::derive_client_and_server_from_master_key_material(
+                &srtp_master_key_material,
+            );
         let now = Instant::now();
         let at = |millis| now + Duration::from_millis(millis);
         let mut sender = Endpoint::new(receiver_key.clone(), sender_key.clone(), now, 1, 2);
